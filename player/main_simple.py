@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import io # Ajout pour BytesIO
+import numpy as np
+import librosa
+from logging.handlers import RotatingFileHandler
 
 # Ajouter le chemin src au path
 sys.path.append(str(Path(__file__).resolve().parent / "src"))
@@ -34,6 +37,24 @@ from pipecat.transports.services.daily import (
 )
 from pipecat.frames.frames import TTSSpeakFrame, TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+# Créer un dossier pour les logs
+log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(log_dir, exist_ok=True)
+
+# Configuration du logger principal
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Ajouter un handler pour fichier
+file_handler = RotatingFileHandler(
+    os.path.join(log_dir, "player.log"), 
+    maxBytes=10*1024*1024,  # 10 Mo maximum
+    backupCount=5           # Garder 5 fichiers de sauvegarde
+)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
 
 # ---------------------------------------------------------------------------
 # Configuration du logging
@@ -82,6 +103,7 @@ class SimpleApiClient:
         except Exception as e:
             self.logger.error(f"❌ Erreur lors de la création/envoi du WAV: {e}")
             return None
+
 # ---------------------------------------------------------------------------
 # Processeur audio simple
 # ---------------------------------------------------------------------------
@@ -140,6 +162,46 @@ class SimpleAudioProcessor(FrameProcessor):
                     self._buffer.clear()
         
         await self.push_frame(frame, direction)
+
+    def _resample_audio(self, audio_data):
+        """Rééchantillonne l'audio à 88200Hz pour compatibilité NeuroSync."""
+        try:
+            # Convertir bytes en int16
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Log avant rééchantillonnage 
+            self._logger.info(f"Audio original: longueur={len(audio_np)}, min={np.min(audio_np)}, "
+                             f"max={np.max(audio_np)}, moyenne={np.mean(np.abs(audio_np))}")
+            
+            # Normalisation en float32 dans [-1, 1]
+            audio_np = audio_np.astype(np.float32) / np.iinfo(np.int16).max
+            
+            # Rééchantillonnage avec librosa
+            resampled_np = librosa.resample(
+                audio_np, 
+                orig_sr=self._sample_rate, 
+                target_sr=88200
+            )
+            
+            # Reconversion en int16
+            resampled_int16 = (resampled_np * np.iinfo(np.int16).max).astype(np.int16)
+            
+            # Log après rééchantillonnage
+            self._logger.info(f"Audio rééchantillonné: longueur={len(resampled_int16)}, min={np.min(resampled_int16)}, "
+                             f"max={np.max(resampled_int16)}, moyenne={np.mean(np.abs(resampled_int16))}")
+            
+            # Sauvegarder l'audio pour débogage (optionnel)
+            # import wave
+            # with wave.open("debug_audio.wav", "wb") as wf:
+            #     wf.setnchannels(1)
+            #     wf.setsampwidth(2)  # 16 bits
+            #     wf.setframerate(88200)
+            #     wf.writeframes(resampled_int16.tobytes())
+            
+            return resampled_int16.tobytes()
+        except Exception as e:
+            self._logger.error(f"Erreur de rééchantillonnage: {e}")
+            return audio_data  # Renvoyer les données d'origine en cas d'erreur
 
 # ---------------------------------------------------------------------------
 # Pipeline principale (le reste du fichier reste identique)
