@@ -37,6 +37,7 @@ from pipecat.transports.services.daily import (
 )
 from pipecat.frames.frames import TTSSpeakFrame, TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from src.processors.audio_delay import AudioDelayProcessor
 
 # Créer un dossier pour les logs
 log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -268,6 +269,18 @@ api_client = SimpleApiClient(host=NS_HOST, port=NS_PORT) #
 # Processeur audio
 audio_processor = SimpleAudioProcessor(api_client) #
 
+# Paramètres audio
+NEUROSYNC_BUFFER_DURATION_SECONDS = 0.5
+ACTUAL_TTS_SAMPLE_RATE = 24000  # Fréquence pour OpenAI TTS
+
+# Processeur de délai pour l'audio sortant
+audio_delay = AudioDelayProcessor(
+    delay_seconds=NEUROSYNC_BUFFER_DURATION_SECONDS,
+    audio_sample_rate=ACTUAL_TTS_SAMPLE_RATE,  # Utiliser la bonne fréquence
+    audio_channels=1,
+    audio_sample_width=2
+)
+
 # Messages système
 messages = [
     {
@@ -281,14 +294,15 @@ Sois fière, audacieuse et aventureuse. Tu es toujours prête pour l'action."""
 context = OpenAILLMContext(messages)
 context_agg = llm.create_context_aggregator(context)
 
-# Pipeline simplifiée sans buffer
+# Définition de la pipeline
 pipeline = Pipeline([
     transport.input(),
     stt,
     context_agg.user(),
     llm,
     tts,
-    audio_processor,  # Simple processeur audio #
+    audio_processor,
+    audio_delay,                  # Le processeur de délai avec la bonne SR
     context_agg.assistant(),
     transport.output()
 ])
