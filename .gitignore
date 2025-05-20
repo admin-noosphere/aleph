@@ -1,0 +1,104 @@
+# Fichiers système
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environnements Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environnements Conda
+/conda-env/
+/miniconda/
+/anaconda/
+*.conda_env
+
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs et données temporaires
+*.log
+logs/
+temp/
+tmp/
+.coverage
+htmlcov/
+coverage/
+.pytest_cache/
+pytest-results.xml
+.tox/
+nosetests.xml
+
+# API - Spécifique
+api/models/
+api/*.pcm
+api/*.wav
+api/*.mp3
+api/debug_logs/
+api/*.out
+
+# Player - Spécifique
+player/node_modules/
+player/dist/
+player/build/
+player/.cache/
+player/.vite/
+player/coverage/
+
+# IDEs et éditeurs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.history/
+
+# Autres
+.secret
+.credentials
+*.env.local
+*.env.development.local
+*.env.test.local
+*.env.production.local
+
+# Fichiers audio (partout dans le projet)
+*.pcm
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.aac
+*.m4a
+*.aiff
+*.wma
+
+# Dossiers contenant potentiellement des fichiers audio
+audio_logs/
+audio_samples/
+recordings/
+samples/
+voices/

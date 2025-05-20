@@ -1,0 +1,1 @@
+# Module d'intégration NeuroSync pour Gala v1
