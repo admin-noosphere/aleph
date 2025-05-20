@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Gala - Version simplifiée qui envoie uniquement l'audio à l'API
-Pas de gestion LiveLink - tout est géré par l'API
-"""
-
 import asyncio
 import itertools
 import json
@@ -14,6 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import io # Ajout pour BytesIO
 
 # Ajouter le chemin src au path
 sys.path.append(str(Path(__file__).resolve().parent / "src"))
@@ -21,7 +16,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "src"))
 import aiohttp
 import google.generativeai as genai
 import requests
-import wave
+import wave # Ajout pour la création de l'en-tête WAV
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
@@ -56,29 +51,37 @@ class SimpleApiClient:
         self.base_url = f"http://{host}:{port}"
         self.logger = logging.getLogger(__name__)
         
-    async def send_audio(self, audio_data: bytes, sample_rate: int = 16000):
-        """Envoie l'audio à l'API pour traitement"""
+    async def send_audio(self, audio_data: bytes, sample_rate: int = 88200, channels: int = 1, sample_width: int = 2): # Changé 16000 en 88200 par défaut
+        """Envoie l'audio à l'API pour traitement après l'avoir encapsulé dans un format WAV."""
         try:
+            # Créer un fichier WAV en mémoire
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(sample_width) # 2 bytes pour 16-bit PCM
+                wf.setframerate(sample_rate)  # Utilisera la valeur de sample_rate (maintenant 88200 Hz par défaut ou passée)
+                wf.writeframes(audio_data)
+            
+            wav_bytes = wav_buffer.getvalue()
+            
             async with aiohttp.ClientSession() as session:
-                # Envoyer l'audio directement
                 async with session.post(
                     f"{self.base_url}/audio_to_blendshapes",
-                    data=audio_data,
-                    headers={'Content-Type': 'audio/wav'},
+                    data=wav_bytes, 
+                    headers={'Content-Type': 'audio/wav'}, 
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        self.logger.info(f"✅ API a traité l'audio")
+                        self.logger.info(f"✅ API a traité l'audio (envoyé comme WAV à {sample_rate} Hz)")
                         return result
                     else:
-                        self.logger.error(f"❌ Erreur API: {response.status}")
+                        self.logger.error(f"❌ Erreur API: {response.status} - {await response.text()}")
                         return None
                 
         except Exception as e:
-            self.logger.error(f"❌ Erreur: {e}")
+            self.logger.error(f"❌ Erreur lors de la création/envoi du WAV: {e}")
             return None
-
 # ---------------------------------------------------------------------------
 # Processeur audio simple
 # ---------------------------------------------------------------------------
@@ -92,13 +95,18 @@ class SimpleAudioProcessor(FrameProcessor):
         
         # Buffer pour accumulation
         self._buffer = bytearray()
-        self._min_buffer_size = 4800  # ~300ms à 16kHz
+        # Envoyer des chunks plus petits pourrait être préférable pour la latence,
+        # mais assurez-vous que NeuroSync peut les gérer.
+        # 4800 bytes @ 16kHz, 16-bit mono = 150ms.
+        # La fonction NeuroSync traite probablement des segments un peu plus longs.
+        # Si vous avez toujours des problèmes, essayez d'augmenter cette taille
+        # ou d'ajuster la logique de chunking côté API si possible.
+        self._min_buffer_size = int(16000 * 2 * 0.5)  #  0.5 mini ~300ms à 16kHz, 16-bit mono (9600 bytes)
+                                         # Augmenté pour potentiellement avoir des segments plus stables pour NeuroSync
         
     async def process_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
-        # Toujours appeler super()
         await super().process_frame(frame, direction)
         
-        # Traiter l'audio uniquement
         if (
             direction == FrameDirection.DOWNSTREAM 
             and hasattr(frame, "audio") 
@@ -106,27 +114,35 @@ class SimpleAudioProcessor(FrameProcessor):
         ):
             audio_data = frame.audio
             if isinstance(audio_data, bytes) and len(audio_data) > 0:
-                # Ajouter au buffer
                 self._buffer.extend(audio_data)
                 
-                # Si assez de données, envoyer
                 if len(self._buffer) >= self._min_buffer_size:
-                    self._logger.info(f"⚡ Envoi de {len(self._buffer)} octets à l'API")
+                    self._logger.info(f"⚡ Envoi de {len(self._buffer)} octets (PCM) à l'API sous format WAV")
                     
-                    # Envoyer à l'API
+                    # !! IMPORTANT !!
+                    # Les données dans self._buffer sont probablement à 16000 Hz.
+                    # Vous DEVEZ les rééchantillonner à 88200 Hz avant cette étape.
+                    # Voir la section sur le rééchantillonnage ci-dessous.
+                    # Pour l'instant, nous passons la nouvelle fréquence cible :
+
+                    audio_to_send = bytes(self._buffer) 
+                    # Exemple conceptuel de rééchantillonnage (nécessite une implémentation réelle)
+                    # resampled_audio_data = await self.resample_audio(audio_to_send, 16000, 88200)
+
                     await self.api_client.send_audio(
-                        bytes(self._buffer), 
-                        sample_rate=16000
+                        # resampled_audio_data, # Idéalement, vous envoyez les données rééchantillonnées
+                        audio_to_send,      # Si vous n'avez pas encore le rééchantillonnage, ceci est incorrect pour le modèle
+                        sample_rate=88200,  # Changé 16000 en 88200
+                        channels=1,
+                        sample_width=2 
                     )
                     
-                    # Vider le buffer
                     self._buffer.clear()
         
-        # Propager le frame
         await self.push_frame(frame, direction)
 
 # ---------------------------------------------------------------------------
-# Pipeline principale
+# Pipeline principale (le reste du fichier reste identique)
 # ---------------------------------------------------------------------------
 
 # Chargement des variables
@@ -185,10 +201,10 @@ transport = DailyTransport(
 )
 
 # Client API simple
-api_client = SimpleApiClient(host=NS_HOST, port=NS_PORT)
+api_client = SimpleApiClient(host=NS_HOST, port=NS_PORT) #
 
 # Processeur audio
-audio_processor = SimpleAudioProcessor(api_client)
+audio_processor = SimpleAudioProcessor(api_client) #
 
 # Messages système
 messages = [
@@ -210,7 +226,7 @@ pipeline = Pipeline([
     context_agg.user(),
     llm,
     tts,
-    audio_processor,  # Simple processeur audio
+    audio_processor,  # Simple processeur audio #
     context_agg.assistant(),
     transport.output()
 ])
@@ -247,7 +263,7 @@ async def main():
     
     # Vérifier l'API
     try:
-        response = requests.get(f"http://{NS_HOST}:{NS_PORT}/health")
+        response = requests.get(f"http://{NS_HOST}:{NS_PORT}/health") #
         if response.status_code == 200:
             logger.info("✅ API accessible")
         else:
