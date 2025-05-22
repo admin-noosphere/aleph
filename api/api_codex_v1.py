@@ -12,6 +12,8 @@ import warnings
 from typing import List
 import threading
 import time
+import io # Added import
+import wave # Added import
 from logging.handlers import RotatingFileHandler
 
 from flask import Flask, request, jsonify
@@ -36,10 +38,11 @@ from models.neurosync.model.model import load_model
 # Module LiveLink style NeuroSync_Player
 from modules.livelink_neurosync import LiveLinkNeuroSync
 
-# Paramètres de connexion
-LIVELINK_IP = "192.168.1.14"
-LIVELINK_PORT = 11111
-API_PORT = 6969
+# Configuration from environment variables
+LIVELINK_IP = os.getenv("LIVELINK_IP", "192.168.1.14")
+LIVELINK_PORT = 11111 # Kept as constant, can be made env-configurable if needed
+API_PORT = int(os.getenv("API_PORT", "6969"))
+AUTO_IDLE_TIMEOUT_SECONDS = int(os.getenv("AUTO_IDLE_TIMEOUT_SECONDS", "5"))
 
 # Créer un dossier pour les logs
 log_dir = "logs"
@@ -65,8 +68,10 @@ app = Flask(__name__)
 # Globals
 blendshape_model = None
 livelink = None
-idle_thread = None
-idle_running = False
+idle_thread = None # Will hold the thread object for the idle animation loop
+monitor_thread = None # Will hold the thread object for the activity monitor
+idle_running = False # Master switch for whether idle animation should be active
+last_audio_time = time.time() # Timestamp of the last audio processing activity
 
 
 def load_neurosync_model():
@@ -107,20 +112,41 @@ def health():
         "status": "healthy",
         "model_loaded": blendshape_model is not None,
         "livelink_connected": livelink is not None,
-        "port": API_PORT,
-        "livelink_ip": LIVELINK_IP,
+        "port": API_PORT, # Loaded from env
+        "livelink_ip": LIVELINK_IP, # Loaded from env
         "livelink_port": LIVELINK_PORT,
+        "auto_idle_timeout": AUTO_IDLE_TIMEOUT_SECONDS # Added for info
     })
 
 
 @app.route('/audio_to_blendshapes', methods=['POST'])
 def audio_to_blendshapes_route():
+    global idle_running, last_audio_time # Added globals
     audio_bytes = request.data
     content_length = len(audio_bytes) if audio_bytes else 0
-    logger.info(f"Requête reçue : {content_length} octets")
+    # logger.info(f"Requête reçue : {content_length} octets") # Original log, will be covered by WAV log or warning
 
     if not audio_bytes:
+        logger.warning("Audio_to_blendshapes: No audio data received.")
         return jsonify({"status": "error", "message": "No audio data"}), 400
+
+    # Log WAV characteristics
+    try:
+        with io.BytesIO(audio_bytes) as wav_file_like:
+            with wave.open(wav_file_like, 'rb') as wf:
+                actual_sr = wf.getframerate()
+                actual_channels = wf.getnchannels()
+                actual_swidth = wf.getsampwidth()
+                num_frames = wf.getnframes()
+                logger.info(f"Received audio WAV data: SR={actual_sr}, Channels={actual_channels}, SampleWidth={actual_swidth}, Frames={num_frames}, Size={len(audio_bytes)} bytes")
+    except Exception as e:
+        logger.warning(f"Could not parse incoming audio as WAV: {e}. Assuming raw PCM or expected format for NeuroSync. Size={len(audio_bytes)} bytes")
+
+    # Update activity timestamp and manage idle state
+    last_audio_time = time.time()
+    if idle_running:
+        logger.info("Audio data received: stopping active idle animation.")
+        idle_running = False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     generated = generate_facial_data_from_bytes(
@@ -226,65 +252,87 @@ def test_animation():
     })
 
 
-def idle_animation_loop():
+def managed_idle_animation_loop():
     """Fonction exécutée dans un thread pour envoyer des blendshapes d'idle en continu."""
-    global idle_running
-    logger.info("Démarrage de l'animation idle")
+    global idle_running, livelink, logger
+    logger.info("Démarrage du thread managed_idle_animation_loop.")
     
     frame_count = 0
-    while idle_running:
-        # Créer des blendshapes neutres avec légère respiration/clignement
-        idle_values = [0.0] * 68  # Exactement 68 valeurs
-        
-        # Simuler respiration (léger mouvement de la poitrine/épaules)
-        breathing = (1 + np.sin(frame_count / 30)) / 2 * 0.1
-        
-        # Simuler clignement occasionnel
-        blink = 0.0
-        if frame_count % 150 < 5:  # Clignement toutes les ~5 secondes
-            blink = 0.8
-        
-        # Indices corrects pour les yeux dans ARKit (68)
-        idle_values[0] = blink  # EyeBlinkLeft 
-        idle_values[1] = blink  # EyeBlinkRight
-        
-        # Log pour débogage
-        logger.info(f"Idle: envoi de {len(idle_values)} blendshapes")
-        
-        send_to_livelink(idle_values)
-        frame_count += 1
-        time.sleep(1/30)  # ~30 FPS
-    
-    logger.info("Arrêt de l'animation idle")
+    while True:
+        if idle_running:
+            # Créer des blendshapes neutres avec légère respiration/clignement
+            idle_values = [0.0] * 68  # Exactement 68 valeurs
+            
+            # Simuler respiration (léger mouvement de la poitrine/épaules)
+            # Note: This breathing simulation is very subtle.
+            breathing = (1 + np.sin(frame_count / 30.0)) / 2.0 * 0.05 # Reduced intensity
+            
+            # Simuler clignement occasionnel
+            blink = 0.0
+            if (frame_count % 150) < 5:  # Clignement toutes les ~5 secondes (150 frames / 30 fps = 5s)
+                blink = 0.9 # Full blink
+            elif (frame_count % 150) < 10: # Keep eyes closed for a bit
+                blink = 0.9
+            
+            idle_values[0] = blink  # EyeBlinkLeft 
+            idle_values[1] = blink  # EyeBlinkRight
+            
+            if livelink:
+                send_to_livelink(idle_values)
+                logger.debug(f"Sent idle frame: {frame_count}, Blink: {blink}, Breathing: {breathing:.3f}")
+            frame_count += 1
+        else:
+            if frame_count != 0: 
+                logger.debug("Idle not running. Resetting idle frame_count.")
+            frame_count = 0 # Reset frame count when idle becomes inactive
+            
+        time.sleep(1/30.0)  # Loop runs consistently at ~30 FPS
 
+def audio_activity_monitor():
+    """Monitors for audio inactivity and triggers idle animation."""
+    global idle_running, last_audio_time, logger, AUTO_IDLE_TIMEOUT_SECONDS
+    logger.info("Démarrage du thread audio_activity_monitor.")
+    while True:
+        time.sleep(1) # Check every second
+        if not idle_running and (time.time() - last_audio_time > AUTO_IDLE_TIMEOUT_SECONDS):
+            logger.info(f"No audio for {AUTO_IDLE_TIMEOUT_SECONDS}s. Triggering auto-idle.")
+            idle_running = True
 
-@app.route('/start_idle', methods=['GET'])
+@app.route('/start_idle', methods=['POST']) # Changed to POST for consistency
 def start_idle():
     """Démarre l'animation idle en continu."""
-    global idle_thread, idle_running
+    global idle_running, last_audio_time, logger
     
-    if idle_thread and idle_thread.is_alive():
-        return jsonify({"status": "warning", "message": "Animation idle déjà en cours"})
-    
+    logger.info("Manual /start_idle called.")
+    last_audio_time = time.time() # Update to prevent auto-idle from immediately conflicting
     idle_running = True
-    idle_thread = threading.Thread(target=idle_animation_loop)
-    idle_thread.daemon = True
-    idle_thread.start()
-    
-    return jsonify({"status": "success", "message": "Animation idle démarrée"})
+    return jsonify({"status": "success", "message": "Idle animation explicitly started."})
 
 
-@app.route('/stop_idle', methods=['GET'])
+@app.route('/stop_idle', methods=['POST']) # Changed to POST
 def stop_idle():
     """Arrête l'animation idle."""
-    global idle_running
+    global idle_running, logger
     
+    logger.info("Manual /stop_idle called.")
     idle_running = False
-    return jsonify({"status": "success", "message": "Animation idle arrêtée"})
+    return jsonify({"status": "success", "message": "Idle animation explicitly stopped."})
 
 
 if __name__ == '__main__':
+ 
     logger.info("=== Démarrage API Codex v1 ===")
     load_neurosync_model()
     init_livelink()
+
+    logger.info("Starting background managed idle animation thread.")
+    idle_thread = threading.Thread(target=managed_idle_animation_loop)
+    idle_thread.daemon = True
+    idle_thread.start()
+
+    logger.info("Starting background audio activity monitor thread.")
+    monitor_thread = threading.Thread(target=audio_activity_monitor)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+
     app.run(host='0.0.0.0', port=API_PORT, debug=False)
