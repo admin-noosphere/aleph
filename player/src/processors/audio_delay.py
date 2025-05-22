@@ -8,6 +8,9 @@ import asyncio
 import logging
 from collections import deque
 from typing import Optional
+import os
+import time
+import wave
 
 from pipecat.frames.frames import Frame, AudioRawFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -29,6 +32,13 @@ class AudioDelayProcessor(FrameProcessor):
         self.channels = audio_channels
         self.sample_width = audio_sample_width  # Bytes par sample (ex: 2 pour 16-bit PCM)
         
+        # Ajouter ces variables dans AudioDelayProcessor aussi
+        self.ENABLE_RESAMPLING = False
+        self.SAVE_AUDIO = True
+        
+        self._logger.info(f"AudioDelayProcessor: Resampling {'ACTIVÉ' if self.ENABLE_RESAMPLING else 'DÉSACTIVÉ'}")
+        self._logger.info(f"AudioDelayProcessor: Sauvegarde audio {'ACTIVÉE' if self.SAVE_AUDIO else 'DÉSACTIVÉE'}")
+        
         # Calculer la taille du buffer en octets pour le délai souhaité
         # Octets par seconde = sample_rate * channels * sample_width
         bytes_per_second = self.sample_rate * self.channels * self.sample_width
@@ -39,15 +49,28 @@ class AudioDelayProcessor(FrameProcessor):
         
         self._current_buffered_audio_duration_ms = 0  # Pour suivre la durée audio actuellement bufferisée
 
+        # Variable qui accumulera tout l'audio d'une phrase TTS
+        self._current_tts_buffer = bytearray()
+        self._is_tts_speaking = False
+
         self._logger.info(f"AudioDelayProcessor initialisé avec un délai de {self.delay_seconds}s, "
                          f"correspondant à {self._delay_buffer_size_bytes} octets @ {self.sample_rate}Hz.")
+
+        # Créer le dossier pour les fichiers WAV
+        self.wave_dir = os.path.join(os.path.dirname(__file__), "..", "..", "wave_tts_output")
+        os.makedirs(self.wave_dir, exist_ok=True)
+        self._logger.info(f"Dossier pour les WAV du TTS: {self.wave_dir}")
+
+        # Ajoutez ces variables dans __init__:
+        self._buffer_for_saving = bytearray()
+        self._last_save_time = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if direction == FrameDirection.DOWNSTREAM:
-            # On ne retarde que l'audio du bot (TTS) allant vers la sortie Daily.
-            is_audio_frame_to_delay = isinstance(frame, TTSAudioRawFrame) or isinstance(frame, AudioRawFrame)
+            # Par celle-ci (pour ne traiter QUE l'audio TTS):
+            is_audio_frame_to_delay = isinstance(frame, TTSAudioRawFrame)
 
             if is_audio_frame_to_delay and hasattr(frame, 'audio') and frame.audio:
                 # Log pour vérifier la fréquence d'échantillonnage réelle
@@ -56,6 +79,9 @@ class AudioDelayProcessor(FrameProcessor):
                 
                 self._audio_byte_buffer.extend(frame.audio)
                 
+                # Aussi l'ajouter au buffer pour sauvegarde
+                self._buffer_for_saving.extend(frame.audio)
+                
                 # Calculer la durée actuelle de l'audio dans le buffer
                 current_bytes_in_buffer = len(self._audio_byte_buffer)
                 bytes_per_sample_frame = self.channels * self.sample_width
@@ -63,6 +89,19 @@ class AudioDelayProcessor(FrameProcessor):
                 self._current_buffered_audio_duration_ms = (num_samples_in_buffer / self.sample_rate) * 1000
 
                 self._logger.debug(f"Audio ajouté au buffer de délai. Buffer actuel: {current_bytes_in_buffer} bytes / {self._delay_buffer_size_bytes} bytes")
+
+                # Si le buffer de délai est suffisamment rempli (500ms d'audio)
+                now = time.time()
+                if self.SAVE_AUDIO and len(self._buffer_for_saving) > 0 and (now - self._last_save_time) >= 0.5:
+                    filename = os.path.join(self.wave_dir, f"delay_buffer_500ms_{now}.wav")
+                    with wave.open(filename, 'wb') as wf:
+                        wf.setnchannels(self.channels)
+                        wf.setsampwidth(self.sample_width)
+                        wf.setframerate(frame.sample_rate if hasattr(frame, 'sample_rate') else self.sample_rate)
+                        wf.writeframes(self._buffer_for_saving)
+                    self._logger.info(f"Sauvegardé buffer de délai complet de {len(self._buffer_for_saving)} bytes dans {filename}")
+                    self._buffer_for_saving = bytearray()
+                    self._last_save_time = now
 
                 # Libérer l'audio (et les frames en attente) une fois que le buffer de délai est plein
                 while len(self._audio_byte_buffer) >= self._delay_buffer_size_bytes:
@@ -80,19 +119,37 @@ class AudioDelayProcessor(FrameProcessor):
 
                         # Recréer un frame audio avec ce chunk - UTILISER LA MÊME FRÉQUENCE D'ÉCHANTILLONNAGE
                         frame_class = type(frame)
-                        # actual_sample_rate = frame.sample_rate if hasattr(frame, 'sample_rate') else self.sample_rate # Ligne originale
-                        actual_sample_rate = self.sample_rate # FORCER à utiliser la SR de l'initialisation du processeur
-                        self._logger.info(f"AudioDelayProcessor: FORCAGE SR de sortie à {actual_sample_rate} Hz. (SR déclarée du frame entrant était: {frame.sample_rate if hasattr(frame, 'sample_rate') else 'N/A'})")
+                        actual_sample_rate = self.sample_rate if self.ENABLE_RESAMPLING else (frame.sample_rate if hasattr(frame, 'sample_rate') else self.sample_rate)
+                        if self.ENABLE_RESAMPLING:
+                            self._logger.info(f"AudioDelayProcessor: RESAMPLING à {actual_sample_rate} Hz. (Original: {frame.sample_rate})")
+                        else:
+                            self._logger.info(f"AudioDelayProcessor: Conservation SR d'origine: {actual_sample_rate} Hz")
                         delayed_audio_frame = frame_class(bytes(audio_chunk_to_send), actual_sample_rate, self.channels)
+
                         await self.push_frame(delayed_audio_frame, direction)
                         self._logger.debug(f"Envoyé chunk audio retardé: {len(audio_chunk_to_send)} bytes avec sample_rate={actual_sample_rate} Hz")
                 
                 # Ne pas propager le frame audio original immédiatement car il est bufferisé
                 return 
             
-            elif isinstance(frame, (TTSStartedFrame, TTSStoppedFrame)):
-                # Ces frames marquent le début et la fin de la parole du TTS.
-                # Il faut les retarder de la même manière que l'audio.
+            elif isinstance(frame, TTSStartedFrame):
+                self._is_tts_speaking = True
+                self._current_tts_buffer = bytearray()
+                self._delayed_frames_queue.append(frame)
+                self._logger.debug(f"Frame {type(frame).__name__} mis en attente dans delayed_frames_queue.")
+                return  # Ne pas propager immédiatement
+
+            elif isinstance(frame, TTSStoppedFrame):
+                if self.SAVE_AUDIO and len(self._current_tts_buffer) > 0:
+                    timestamp = time.time()
+                    filename = os.path.join(self.wave_dir, f"tts_complete_{timestamp}.wav")
+                    with wave.open(filename, 'wb') as wf:
+                        wf.setnchannels(self.channels)
+                        wf.setsampwidth(self.sample_width)
+                        wf.setframerate(self.sample_rate)
+                        wf.writeframes(self._current_tts_buffer)
+                    self._logger.info(f"TTS audio: Sauvegardé phrase complète ({len(self._current_tts_buffer)} bytes) dans {filename}")
+                self._is_tts_speaking = False
                 self._delayed_frames_queue.append(frame)
                 self._logger.debug(f"Frame {type(frame).__name__} mis en attente dans delayed_frames_queue.")
                 return  # Ne pas propager immédiatement

@@ -16,6 +16,7 @@ import numpy as np
 import librosa
 import aiohttp # Added import
 from logging.handlers import RotatingFileHandler
+import wave 
 
 # Ajouter le chemin src au path
 sys.path.append(str(Path(__file__).resolve().parent / "src"))
@@ -38,17 +39,18 @@ from pipecat.transports.services.daily import (
     DailyParams,
     DailyTransport,
 )
-from pipecat.frames.frames import ( # Added specific frame imports
+from pipecat.frames.frames import (
     TTSSpeakFrame, 
     TTSStartedFrame, 
     TTSStoppedFrame, 
     TTSAudioRawFrame,
-    AudioRawFrame,  # Remplacer AudioFrame par AudioRawFrame
-    VADUserStartedSpeakingFrame, 
+    AudioRawFrame, # Au lieu de AudioFrame
+    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from src.processors.audio_delay import AudioDelayProcessor
+from src.processors.api_sender import ApiSenderProcessor
 
 # Créer un dossier pour les logs
 log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -77,211 +79,6 @@ logging.getLogger("pipecat").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 # Client API minimaliste
 # ---------------------------------------------------------------------------
-class SimpleApiClient:
-    """Client simple pour l'API audio-to-blendshapes"""
-    
-    def __init__(self, host="127.0.0.1", port=6969):
-        self.base_url = f"http://{host}:{port}"
-        self.logger = logging.getLogger(__name__)
-        
-    async def send_audio(self, audio_data: bytes, sample_rate: int = 88200, channels: int = 1, sample_width: int = 2): # Changé 16000 en 88200 par défaut
-        """Envoie l'audio à l'API pour traitement après l'avoir encapsulé dans un format WAV."""
-        try:
-            # Créer un fichier WAV en mémoire
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(sample_width) # 2 bytes pour 16-bit PCM
-                wf.setframerate(sample_rate)  # Utilisera la valeur de sample_rate (maintenant 88200 Hz par défaut ou passée)
-                wf.writeframes(audio_data)
-            
-            wav_bytes = wav_buffer.getvalue()
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/audio_to_blendshapes",
-                    data=wav_bytes, 
-                    headers={'Content-Type': 'audio/wav'}, 
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        self.logger.info(f"✅ API a traité l'audio (envoyé comme WAV à {sample_rate} Hz)")
-                        return result
-                    else:
-                        self.logger.error(f"❌ Erreur API: {response.status} - {await response.text()}")
-                        return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Erreur lors de la création/envoi du WAV: {e}")
-            return None
-
-# ---------------------------------------------------------------------------
-# Processeur audio simple
-# ---------------------------------------------------------------------------
-class SimpleAudioProcessor(FrameProcessor):
-    """Processeur qui bufferise et envoie l'audio à l'API"""
-    
-    def __init__(self, api_client: SimpleApiClient):
-        super().__init__(name="simple_audio_processor")
-        self.api_client = api_client
-        self._logger = logging.getLogger(__name__) # Ensure FrameProcessor initializes this logger
-        
-        # Buffer pour accumulation
-        self._buffer = bytearray()
-
-        # VAD attributes
-        self._is_speaking = False
-        self._silence_start_time = None
-        self._idle_triggered = False
-
-        # Configuration from environment or defaults
-        self.ORIGINAL_SAMPLE_RATE = int(os.getenv("ORIGINAL_SAMPLE_RATE", "16000")) # Default if not set
-        self.TARGET_API_SAMPLE_RATE = int(os.getenv("TARGET_API_SAMPLE_RATE", "88200"))
-        self.MIN_AUDIO_BUFFER_MS = int(os.getenv("MIN_AUDIO_BUFFER_MS", "500"))
-        self.SILENCE_TIMEOUT_MS = int(os.getenv("SILENCE_TIMEOUT_MS", "1000"))
-
-        # Calculate min_buffer_size based on original sample rate and buffer duration
-        # Assumes 1 channel for initial buffer calculation, 2 bytes/sample (16-bit)
-        self._min_buffer_size = int(self.ORIGINAL_SAMPLE_RATE * 1 * 2 * (self.MIN_AUDIO_BUFFER_MS / 1000.0))
-        self._logger.info(f"Initialized SimpleAudioProcessor: Target API SR={self.TARGET_API_SAMPLE_RATE}, Min Buffer Ms={self.MIN_AUDIO_BUFFER_MS} ({self._min_buffer_size} bytes), Silence Timeout Ms={self.SILENCE_TIMEOUT_MS}")
-
-    async def process_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
-        # D'abord appeler la méthode parente pour initialiser correctement le processeur
-        await super().process_frame(frame, direction)
-        
-        # Puis votre logique spécifique
-        if isinstance(frame, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)):
-            is_speaking = isinstance(frame, VADUserStartedSpeakingFrame)
-            self._logger.info(f"VAD: Voice activity changed. Speaking: {is_speaking}")
-            
-            if is_speaking and not self._is_speaking:
-                self._is_speaking = True
-                self._idle_triggered = False
-                self._silence_start_time = None
-                self._logger.info("User started speaking. Attempting to call /stop_idle.")
-                async with aiohttp.ClientSession() as session:
-                    try:
-                        await session.post(f"{self.api_client.base_url}/stop_idle", timeout=aiohttp.ClientTimeout(total=2))
-                        self._logger.info("Successfully called /stop_idle API.")
-                    except Exception as e:
-                        self._logger.error(f"Error calling /stop_idle API: {e}")
-            elif not is_speaking and self._is_speaking:
-                self._is_speaking = False
-                self._silence_start_time = time.time()
-                self._logger.info("User stopped speaking. Silence timer started.")
-            
-            await self.push_frame(frame, direction) # Forward VAD frame
-            return
-
-        if isinstance(frame, AudioRawFrame):  # Remplacer AudioFrame par AudioRawFrame
-            if hasattr(frame, "audio") and frame.audio and hasattr(frame, "sample_rate") and hasattr(frame, "num_channels"):
-                if self._is_speaking:
-                    self._buffer.extend(frame.audio)
-                    # self._logger.debug(f"Audio frame received while speaking. Buffer size: {len(self._buffer)}")
-                    if len(self._buffer) >= self._min_buffer_size:
-                        self._logger.info(f"Audio buffer full for speaking user. Size: {len(self._buffer)}. Processing...")
-                        
-                        # Ensure frame.sample_rate and frame.num_channels are valid
-                        if frame.sample_rate <= 0 or frame.num_channels <=0:
-                            self._logger.error(f"Invalid audio frame properties: SR={frame.sample_rate}, Channels={frame.num_channels}. Skipping.")
-                            self._buffer.clear() # Clear buffer to prevent processing invalid data
-                            await self.push_frame(frame, direction)
-                            return
-
-                        resampled_audio = self._resample_audio(
-                            audio_data=bytes(self._buffer),
-                            orig_sr=frame.sample_rate,
-                            target_sr=self.TARGET_API_SAMPLE_RATE,
-                            num_channels=frame.num_channels
-                        )
-                        if resampled_audio:
-                            self._logger.info(f"Resampling successful. Sending {len(resampled_audio)} bytes to API at {self.TARGET_API_SAMPLE_RATE} Hz.")
-                            await self.api_client.send_audio(
-                                resampled_audio,
-                                sample_rate=self.TARGET_API_SAMPLE_RATE,
-                                channels=1, # Resampled to mono
-                                sample_width=2 # 16-bit
-                            )
-                        else:
-                            self._logger.warning("Resampling failed or returned None. No audio sent to API.")
-                        self._buffer.clear()
-                elif self._silence_start_time and not self._idle_triggered:
-                    if (time.time() - self._silence_start_time) * 1000 > self.SILENCE_TIMEOUT_MS:
-                        self._logger.info("Silence timeout reached. Attempting to call /start_idle.")
-                        async with aiohttp.ClientSession() as session:
-                            try:
-                                await session.post(f"{self.api_client.base_url}/start_idle", timeout=aiohttp.ClientTimeout(total=2))
-                                self._logger.info("Successfully called /start_idle API.")
-                                self._idle_triggered = True
-                            except Exception as e:
-                                self._logger.error(f"Error calling /start_idle API: {e}")
-            
-            await self.push_frame(frame, direction) # Forward Audio frame
-            return
-        
-        # For any other frame types, just push them
-        self._logger.debug(f"Pushing unhandled frame type: {type(frame)}")
-        await self.push_frame(frame, direction)
-
-    def _resample_audio(self, audio_data: bytes, orig_sr: int, target_sr: int, num_channels: int) -> Optional[bytes]:
-        """Rééchantillonne l'audio à target_sr pour compatibilité NeuroSync et convertit en mono."""
-        try:
-            self._logger.info(f"Attempting resampling: {len(audio_data)} bytes, SR_orig={orig_sr}, SR_target={target_sr}, Channels={num_channels}")
-            
-            # Convertir bytes en int16 numpy array
-            audio_np = np.frombuffer(audio_data, dtype=np.int16)
-            
-            # Convertir en float32 pour librosa
-            audio_float = audio_np.astype(np.float32) / np.iinfo(np.int16).max
-            
-            # Convertir en mono si nécessaire
-            if num_channels > 1:
-                self._logger.info(f"Audio has {num_channels} channels. Converting to mono.")
-                # librosa.to_mono expects a float waveform, shape (channels, samples) or (samples,) if already mono
-                # If audio_float is (samples,), it's already mono. If it's (samples * channels), it needs reshaping.
-                # Assuming interleaved audio if multi-channel, e.g., LRLRLR...
-                if audio_float.ndim == 1 and num_channels > 1: # Check if it's a flat array needing reshape
-                     # Reshape to (samples, channels) then transpose for to_mono which expects (channels, samples)
-                    audio_float_reshaped = audio_float.reshape(-1, num_channels).T 
-                    audio_mono_float = librosa.to_mono(audio_float_reshaped)
-                    self._logger.info(f"Converted to mono. New shape: {audio_mono_float.shape}")
-                elif audio_float.ndim == 2 and audio_float.shape[0] == num_channels: # Already (channels, samples)
-                    audio_mono_float = librosa.to_mono(audio_float)
-                    self._logger.info(f"Input was (channels, samples). Converted to mono. New shape: {audio_mono_float.shape}")
-                else: # Already mono or unsupported shape
-                    audio_mono_float = audio_float 
-                    if num_channels > 1: # Log if we expected stereo but didn't reshape/convert correctly
-                        self._logger.warning(f"Multi-channel audio ({num_channels}) not explicitly converted to mono due to array shape {audio_float.shape}. Proceeding as if mono.")
-            else: # Already mono
-                audio_mono_float = audio_float
-                self._logger.info("Audio is already mono.")
-
-            # Rééchantillonnage avec librosa
-            if orig_sr == target_sr:
-                self._logger.info(f"Original sample rate ({orig_sr}) matches target ({target_sr}). Skipping resampling.")
-                resampled_float = audio_mono_float
-            else:
-                self._logger.info(f"Resampling from {orig_sr}Hz to {target_sr}Hz using kaiser_best.")
-                resampled_float = librosa.resample(
-                    audio_mono_float, 
-                    orig_sr=orig_sr, 
-                    target_sr=target_sr,
-                    res_type='kaiser_best' # As specified
-                )
-                self._logger.info(f"Resampling done. New length: {len(resampled_float)}")
-            
-            # Reconversion en int16
-            resampled_int16 = (resampled_float * np.iinfo(np.int16).max).astype(np.int16)
-            
-            self._logger.info(f"Resampled audio: length={len(resampled_int16)}, min={np.min(resampled_int16) if len(resampled_int16) > 0 else 'N/A'}, "
-                             f"max={np.max(resampled_int16) if len(resampled_int16) > 0 else 'N/A'}, target_sr={target_sr}")
-            
-            return resampled_int16.tobytes()
-
-        except Exception as e:
-            self._logger.error(f"Error during resampling: {e}", exc_info=True)
-            return None
 
 # ---------------------------------------------------------------------------
 # Pipeline principale (le reste du fichier reste identique)
@@ -342,23 +139,29 @@ transport = DailyTransport(
     )
 )
 
-# Client API simple
-api_client = SimpleApiClient(host=NS_HOST, port=NS_PORT) #
 
-# Processeur audio
-audio_processor = SimpleAudioProcessor(api_client) #
 
 # Paramètres audio
 NEUROSYNC_BUFFER_DURATION_SECONDS = 0.5
-ACTUAL_TTS_SAMPLE_RATE = 24000  # Fréquence pour OpenAI TTS
+ACTUAL_TTS_SAMPLE_RATE = 16000  # Fréquence pour OpenAI TTS
 
 # Processeur de délai pour l'audio sortant
 audio_delay = AudioDelayProcessor(
     delay_seconds=NEUROSYNC_BUFFER_DURATION_SECONDS,
-    audio_sample_rate=ACTUAL_TTS_SAMPLE_RATE,  # Utiliser la bonne fréquence
+    audio_sample_rate=ACTUAL_TTS_SAMPLE_RATE,
     audio_channels=1,
     audio_sample_width=2
 )
+
+# Configuration supplémentaire après l'initialisation
+audio_delay.ENABLE_RESAMPLING = False
+audio_delay.SAVE_AUDIO = True
+
+# Créer un dossier pour les fichiers WAV
+import os
+audio_delay.wave_dir = os.path.join(os.path.dirname(__file__), "wave_tts_output")
+os.makedirs(audio_delay.wave_dir, exist_ok=True)
+logger.info(f"Dossier pour les WAV du TTS: {audio_delay.wave_dir}")
 
 # Messages système
 messages = [
@@ -374,14 +177,18 @@ context = OpenAILLMContext(messages)
 context_agg = llm.create_context_aggregator(context)
 
 # Définition de la pipeline
+api_sender = ApiSenderProcessor(
+    api_url=f"http://{NS_HOST}:{NS_PORT}/audio_to_blendshapes"
+)
+
 pipeline = Pipeline([
     transport.input(),
     stt,
     context_agg.user(),
     llm,
     tts,
-    audio_processor,
-    audio_delay,                  # Le processeur de délai avec la bonne SR
+    audio_delay,
+    api_sender,        # Nouveau processor dédié à l'envoi API
     context_agg.assistant(),
     transport.output()
 ])
